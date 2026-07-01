@@ -1,16 +1,17 @@
 // -----------------------------------------------------------------------------
 // File       : axi4_mem_slave.sv
 // Author     : ChatGPT
-// Description: AXI4 Full single-outstanding memory slave model。
+// Description: AXI4 Full multi-outstanding memory slave model。
 //
 // 特性：
 //   * 支持 AXI4 AW/W/B/AR/R 五通道基础握手
-//   * AW 和 W 通道解耦：先接收 AW，再逐拍接收 W
+//   * AW 和 W 通道解耦：AW 可提前进入队列，W 按 AW 接收顺序消耗队首事务
+//   * 支持多个写/读 outstanding；第一版顺序执行并正确 echo ID，不做乱序返回
+//   * 后端接入 byte-addressable memory，可用于 AXI 读写一致性验证
 //   * 支持 FIXED / INCR burst；WRAP / reserved burst 会接收事务并返回 SLVERR
 //   * 支持 WSTRB byte strobe 部分写
 //   * 支持 slave_wr_enable / slave_rd_enable 控制；关闭时仍接收事务并返回 SLVERR，
 //     避免 master 因等待 ready 或 response 而永久阻塞
-//   * 第一版允许单写事务 outstanding、单读事务 outstanding
 //
 // 说明：
 //   当前版本为学习和 VIP 对接用 DUT，优先保证握手合法、结构清晰、易调试。
@@ -20,10 +21,12 @@
 `default_nettype none
 
 module axi4_mem_slave #(
-  parameter int ADDR_WIDTH = 32,
-  parameter int DATA_WIDTH = 64,
-  parameter int ID_WIDTH   = 4,
-  parameter int MEM_BYTES  = 4096
+  parameter int ADDR_WIDTH     = 32,
+  parameter int DATA_WIDTH     = 64,
+  parameter int ID_WIDTH       = 4,
+  parameter int MEM_BYTES      = 4096,
+  parameter int WR_OUTSTANDING = 4,
+  parameter int RD_OUTSTANDING = 4
 ) (
   input  logic                     aclk,
   input  logic                     aresetn,
@@ -83,46 +86,120 @@ module axi4_mem_slave #(
 
   import axi4_defines_pkg::*;
 
-  localparam int STRB_WIDTH = DATA_WIDTH / 8;
+  localparam int STRB_WIDTH  = DATA_WIDTH / 8;
+  localparam int WR_PTR_W    = (WR_OUTSTANDING <= 1) ? 1 : $clog2(WR_OUTSTANDING);
+  localparam int RD_PTR_W    = (RD_OUTSTANDING <= 1) ? 1 : $clog2(RD_OUTSTANDING);
+  localparam int B_PTR_W     = WR_PTR_W;
 
-  typedef enum logic [1:0] {
-    WR_IDLE,
-    WR_DATA,
-    WR_RESP
-  } wr_state_e;
+  typedef struct packed {
+    logic [ID_WIDTH-1:0]   id;
+    logic [ADDR_WIDTH-1:0] addr;
+    logic [7:0]            len;
+    logic [2:0]            size;
+    logic [1:0]            burst;
+    logic [7:0]            beat;
+    logic [1:0]            resp;
+  } wr_ctx_t;
 
-  typedef enum logic [0:0] {
-    RD_IDLE,
-    RD_DATA
-  } rd_state_e;
+  typedef struct packed {
+    logic [ID_WIDTH-1:0] id;
+    logic [1:0]          resp;
+  } b_resp_t;
 
-  wr_state_e wr_state_q;
-  rd_state_e rd_state_q;
+  typedef struct packed {
+    logic [ID_WIDTH-1:0]   id;
+    logic [ADDR_WIDTH-1:0] addr;
+    logic [7:0]            len;
+    logic [2:0]            size;
+    logic [1:0]            burst;
+    logic [7:0]            beat;
+    logic [1:0]            resp;
+  } rd_ctx_t;
 
+  // 后端 memory：AXI4 Full 是 memory-mapped 协议，本模块提供真实 byte storage。
   logic [7:0] mem [0:MEM_BYTES-1];
 
-  logic [ID_WIDTH-1:0]   wr_id_q;
-  logic [ADDR_WIDTH-1:0] wr_addr_q;
-  logic [7:0]            wr_len_q;
-  logic [2:0]            wr_size_q;
-  logic [1:0]            wr_burst_q;
-  logic [7:0]            wr_beat_q;
-  logic [1:0]            wr_resp_q;
+  wr_ctx_t wr_ctx_fifo [0:WR_OUTSTANDING-1];
+  b_resp_t b_resp_fifo [0:WR_OUTSTANDING-1];
+  rd_ctx_t rd_ctx_fifo [0:RD_OUTSTANDING-1];
 
-  logic [ID_WIDTH-1:0]   rd_id_q;
-  logic [ADDR_WIDTH-1:0] rd_addr_q;
-  logic [7:0]            rd_len_q;
-  logic [2:0]            rd_size_q;
-  logic [1:0]            rd_burst_q;
-  logic [7:0]            rd_beat_q;
-  logic [1:0]            rd_resp_q;
+  logic [WR_PTR_W-1:0] wr_ctx_wptr_q;
+  logic [WR_PTR_W-1:0] wr_ctx_rptr_q;
+  logic [B_PTR_W-1:0]  b_resp_wptr_q;
+  logic [B_PTR_W-1:0]  b_resp_rptr_q;
+  logic [RD_PTR_W-1:0] rd_ctx_wptr_q;
+  logic [RD_PTR_W-1:0] rd_ctx_rptr_q;
 
-  logic                  wr_last_expected;
-  logic                  wr_wstrb_extra;
-  logic [1:0]            wr_resp_after_w;
-  logic                  unused_sideband;
+  int unsigned wr_ctx_count_q;
+  int unsigned b_resp_count_q;
+  int unsigned rd_ctx_count_q;
+
+  logic aw_fire;
+  logic w_fire;
+  logic b_fire;
+  logic ar_fire;
+  logic r_fire;
+
+  logic wr_ctx_empty;
+  logic wr_ctx_full;
+  logic b_resp_empty;
+  logic b_resp_full;
+  logic rd_ctx_empty;
+  logic rd_ctx_full;
+
+  logic wr_last_expected;
+  logic wr_wstrb_extra;
+  logic wr_finishing;
+  logic wr_pop_fire;
+  logic [1:0] wr_resp_after_w;
+
+  logic rd_pop_fire;
+  logic unused_sideband;
 
   integer mem_init_i;
+
+  initial begin
+    assert ((DATA_WIDTH == 32) || (DATA_WIDTH == 64) || (DATA_WIDTH == 128))
+      else $error("axi4_mem_slave: DATA_WIDTH must be 32, 64, or 128");
+    assert ((DATA_WIDTH % 8) == 0)
+      else $error("axi4_mem_slave: DATA_WIDTH must be byte aligned");
+    assert (MEM_BYTES > 0)
+      else $error("axi4_mem_slave: MEM_BYTES must be greater than 0");
+    assert (WR_OUTSTANDING > 0)
+      else $error("axi4_mem_slave: WR_OUTSTANDING must be greater than 0");
+    assert (RD_OUTSTANDING > 0)
+      else $error("axi4_mem_slave: RD_OUTSTANDING must be greater than 0");
+  end
+
+  function automatic logic [WR_PTR_W-1:0] inc_wr_ptr(input logic [WR_PTR_W-1:0] ptr);
+    begin
+      if (int'(ptr) == (WR_OUTSTANDING - 1)) begin
+        inc_wr_ptr = '0;
+      end else begin
+        inc_wr_ptr = ptr + 1'b1;
+      end
+    end
+  endfunction
+
+  function automatic logic [B_PTR_W-1:0] inc_b_ptr(input logic [B_PTR_W-1:0] ptr);
+    begin
+      if (int'(ptr) == (WR_OUTSTANDING - 1)) begin
+        inc_b_ptr = '0;
+      end else begin
+        inc_b_ptr = ptr + 1'b1;
+      end
+    end
+  endfunction
+
+  function automatic logic [RD_PTR_W-1:0] inc_rd_ptr(input logic [RD_PTR_W-1:0] ptr);
+    begin
+      if (int'(ptr) == (RD_OUTSTANDING - 1)) begin
+        inc_rd_ptr = '0;
+      end else begin
+        inc_rd_ptr = ptr + 1'b1;
+      end
+    end
+  endfunction
 
   function automatic logic [ADDR_WIDTH-1:0] next_addr(
     input logic [ADDR_WIDTH-1:0] addr,
@@ -198,6 +275,30 @@ module axi4_mem_slave #(
     end
   endfunction
 
+  function automatic logic burst_cross_4kb(
+    input logic [ADDR_WIDTH-1:0] addr,
+    input logic [7:0]            len,
+    input logic [2:0]            size,
+    input logic [1:0]            burst
+  );
+    int unsigned     bytes;
+    longint unsigned first_u;
+    longint unsigned last_u;
+    begin
+      bytes   = axi_size_to_bytes(size);
+      first_u = longint unsigned'(addr);
+
+      if (burst == AXI_BURST_FIXED) begin
+        last_u = first_u + bytes - 1;
+      end else begin
+        last_u = first_u + (longint unsigned'(len) * bytes) + bytes - 1;
+      end
+
+      // AXI4 burst 不应跨越 4KB 边界。
+      burst_cross_4kb = ((first_u >> 12) != (last_u >> 12));
+    end
+  endfunction
+
   function automatic logic [1:0] check_cmd(
     input logic                  enable,
     input logic [ADDR_WIDTH-1:0] addr,
@@ -225,6 +326,10 @@ module axi4_mem_slave #(
       end
 
       if (bytes > STRB_WIDTH) begin
+        ok = 1'b0;
+      end
+
+      if (burst_cross_4kb(addr, len, size, burst)) begin
         ok = 1'b0;
       end
 
@@ -284,14 +389,38 @@ module axi4_mem_slave #(
   endfunction
 
   always_comb begin
-    s_axi_awready  = aresetn && (wr_state_q == WR_IDLE);
-    s_axi_wready   = aresetn && (wr_state_q == WR_DATA);
-    s_axi_arready  = aresetn && (rd_state_q == RD_IDLE);
+    wr_ctx_empty = (wr_ctx_count_q == 0);
+    wr_ctx_full  = (wr_ctx_count_q >= WR_OUTSTANDING);
+    b_resp_empty = (b_resp_count_q == 0);
+    b_resp_full  = (b_resp_count_q >= WR_OUTSTANDING);
+    rd_ctx_empty = (rd_ctx_count_q == 0);
+    rd_ctx_full  = (rd_ctx_count_q >= RD_OUTSTANDING);
 
-    wr_last_expected = (wr_beat_q == wr_len_q);
-    wr_wstrb_extra   = ((s_axi_wstrb & ~beat_strobe_mask(wr_addr_q, wr_size_q)) != '0);
+    wr_last_expected = (!wr_ctx_empty) &&
+                       (wr_ctx_fifo[wr_ctx_rptr_q].beat == wr_ctx_fifo[wr_ctx_rptr_q].len);
+    wr_wstrb_extra   = (!wr_ctx_empty) &&
+                       ((s_axi_wstrb & ~beat_strobe_mask(wr_ctx_fifo[wr_ctx_rptr_q].addr,
+                                                         wr_ctx_fifo[wr_ctx_rptr_q].size)) != '0);
+    wr_finishing     = wr_last_expected || s_axi_wlast;
     wr_resp_after_w  = ((s_axi_wlast != wr_last_expected) || wr_wstrb_extra) ?
-                       AXI_RESP_SLVERR : wr_resp_q;
+                       AXI_RESP_SLVERR : wr_ctx_fifo[wr_ctx_rptr_q].resp;
+
+    s_axi_awready    = aresetn && !wr_ctx_full;
+    s_axi_wready     = aresetn && !wr_ctx_empty && (!wr_finishing || !b_resp_full);
+    s_axi_arready    = aresetn && !rd_ctx_full;
+
+    s_axi_bvalid     = aresetn && !b_resp_empty;
+    s_axi_bid        = b_resp_empty ? '0 : b_resp_fifo[b_resp_rptr_q].id;
+    s_axi_bresp      = b_resp_empty ? AXI_RESP_OKAY : b_resp_fifo[b_resp_rptr_q].resp;
+
+    aw_fire          = s_axi_awvalid && s_axi_awready;
+    w_fire           = s_axi_wvalid  && s_axi_wready;
+    b_fire           = s_axi_bvalid  && s_axi_bready;
+    ar_fire          = s_axi_arvalid && s_axi_arready;
+    r_fire           = s_axi_rvalid  && s_axi_rready;
+
+    wr_pop_fire      = w_fire && wr_finishing;
+    rd_pop_fire      = r_fire && s_axi_rlast;
 
     unused_sideband  = ^{s_axi_awcache, s_axi_awprot, s_axi_awqos, s_axi_awregion,
                          s_axi_arcache, s_axi_arprot, s_axi_arqos, s_axi_arregion};
@@ -299,170 +428,154 @@ module axi4_mem_slave #(
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      wr_state_q   <= WR_IDLE;
-      s_axi_bid    <= '0;
-      s_axi_bresp  <= AXI_RESP_OKAY;
-      s_axi_bvalid <= 1'b0;
-      wr_id_q      <= '0;
-      wr_addr_q    <= '0;
-      wr_len_q     <= '0;
-      wr_size_q    <= '0;
-      wr_burst_q   <= AXI_BURST_INCR;
-      wr_beat_q    <= '0;
-      wr_resp_q    <= AXI_RESP_OKAY;
+      wr_ctx_wptr_q  <= '0;
+      wr_ctx_rptr_q  <= '0;
+      b_resp_wptr_q  <= '0;
+      b_resp_rptr_q  <= '0;
+      wr_ctx_count_q <= 0;
+      b_resp_count_q <= 0;
 
       for (mem_init_i = 0; mem_init_i < MEM_BYTES; mem_init_i = mem_init_i + 1) begin
         mem[mem_init_i] <= '0;
       end
     end else begin
-      unique case (wr_state_q)
-        WR_IDLE: begin
-          s_axi_bvalid <= 1'b0;
+      if (aw_fire) begin
+        // AW 可在已有写事务未完成时继续进入队列，形成多 outstanding。
+        wr_ctx_fifo[wr_ctx_wptr_q].id    <= s_axi_awid;
+        wr_ctx_fifo[wr_ctx_wptr_q].addr  <= s_axi_awaddr;
+        wr_ctx_fifo[wr_ctx_wptr_q].len   <= s_axi_awlen;
+        wr_ctx_fifo[wr_ctx_wptr_q].size  <= s_axi_awsize;
+        wr_ctx_fifo[wr_ctx_wptr_q].burst <= s_axi_awburst;
+        wr_ctx_fifo[wr_ctx_wptr_q].beat  <= '0;
+        wr_ctx_fifo[wr_ctx_wptr_q].resp  <= check_cmd(slave_wr_enable,
+                                                       s_axi_awaddr,
+                                                       s_axi_awlen,
+                                                       s_axi_awsize,
+                                                       s_axi_awburst,
+                                                       s_axi_awlock);
+        wr_ctx_wptr_q <= inc_wr_ptr(wr_ctx_wptr_q);
+      end
 
-          if (s_axi_awvalid && s_axi_awready) begin
-            // AW 和 W 解耦：先锁存 AW，再进入 WR_DATA 接收 W burst。
-            wr_id_q    <= s_axi_awid;
-            wr_addr_q  <= s_axi_awaddr;
-            wr_len_q   <= s_axi_awlen;
-            wr_size_q  <= s_axi_awsize;
-            wr_burst_q <= s_axi_awburst;
-            wr_beat_q  <= '0;
-            wr_resp_q  <= check_cmd(slave_wr_enable,
-                                    s_axi_awaddr,
-                                    s_axi_awlen,
-                                    s_axi_awsize,
-                                    s_axi_awburst,
-                                    s_axi_awlock);
-            wr_state_q <= WR_DATA;
-          end
-        end
+      if (w_fire) begin
+        // AXI4 W 通道没有 WID，因此 W beat 必须按 AW 接收顺序归属到队首写事务。
+        if ((wr_ctx_fifo[wr_ctx_rptr_q].resp == AXI_RESP_OKAY) &&
+            (s_axi_wlast == wr_last_expected) &&
+            !wr_wstrb_extra) begin
+          longint unsigned base_addr;
+          longint unsigned addr_u;
+          longint unsigned mem_addr;
+          int unsigned     lane;
+          logic [DATA_WIDTH/8-1:0] mask;
 
-        WR_DATA: begin
-          if (s_axi_wvalid && s_axi_wready) begin
-            // 只有命令合法、WLAST 匹配、WSTRB 未越过当前 transfer byte lane 时才更新 memory。
-            if ((wr_resp_q == AXI_RESP_OKAY) &&
-                (s_axi_wlast == wr_last_expected) &&
-                !wr_wstrb_extra) begin
-              longint unsigned base_addr;
-              longint unsigned addr_u;
-              longint unsigned mem_addr;
-              int unsigned     lane;
-              logic [DATA_WIDTH/8-1:0] mask;
+          addr_u    = longint unsigned'(wr_ctx_fifo[wr_ctx_rptr_q].addr);
+          lane      = int'(addr_u % STRB_WIDTH);
+          base_addr = addr_u - lane;
+          mask      = beat_strobe_mask(wr_ctx_fifo[wr_ctx_rptr_q].addr,
+                                        wr_ctx_fifo[wr_ctx_rptr_q].size);
 
-              addr_u    = longint unsigned'(wr_addr_q);
-              lane      = int'(addr_u % STRB_WIDTH);
-              base_addr = addr_u - lane;
-              mask      = beat_strobe_mask(wr_addr_q, wr_size_q);
-
-              // WSTRB byte 粒度更新：wstrb[i] 为 1 时才写对应 byte。
-              for (int i = 0; i < STRB_WIDTH; i++) begin
-                mem_addr = base_addr + longint unsigned'(i);
-                if (mask[i] && s_axi_wstrb[i] && (mem_addr < MEM_BYTES)) begin
-                  mem[int'(mem_addr)] <= s_axi_wdata[(8*i) +: 8];
-                end
-              end
-            end
-
-            if (wr_last_expected || s_axi_wlast) begin
-              s_axi_bid    <= wr_id_q;
-              s_axi_bresp  <= wr_resp_after_w;
-              s_axi_bvalid <= 1'b1;
-              wr_resp_q    <= wr_resp_after_w;
-              wr_state_q   <= WR_RESP;
-            end else begin
-              wr_beat_q  <= wr_beat_q + 8'd1;
-              wr_addr_q  <= next_addr(wr_addr_q, wr_size_q, wr_burst_q);
-              wr_resp_q  <= wr_resp_after_w;
+          // WSTRB byte 粒度更新：wstrb[i] 为 1 时才写对应 byte。
+          for (int i = 0; i < STRB_WIDTH; i++) begin
+            mem_addr = base_addr + longint unsigned'(i);
+            if (mask[i] && s_axi_wstrb[i] && (mem_addr < MEM_BYTES)) begin
+              mem[int'(mem_addr)] <= s_axi_wdata[(8*i) +: 8];
             end
           end
         end
 
-        WR_RESP: begin
-          if (s_axi_bvalid && s_axi_bready) begin
-            s_axi_bvalid <= 1'b0;
-            wr_state_q   <= WR_IDLE;
-          end
+        if (wr_finishing) begin
+          b_resp_fifo[b_resp_wptr_q].id   <= wr_ctx_fifo[wr_ctx_rptr_q].id;
+          b_resp_fifo[b_resp_wptr_q].resp <= wr_resp_after_w;
+          b_resp_wptr_q <= inc_b_ptr(b_resp_wptr_q);
+          wr_ctx_rptr_q <= inc_wr_ptr(wr_ctx_rptr_q);
+        end else begin
+          wr_ctx_fifo[wr_ctx_rptr_q].beat <= wr_ctx_fifo[wr_ctx_rptr_q].beat + 8'd1;
+          wr_ctx_fifo[wr_ctx_rptr_q].addr <= next_addr(wr_ctx_fifo[wr_ctx_rptr_q].addr,
+                                                       wr_ctx_fifo[wr_ctx_rptr_q].size,
+                                                       wr_ctx_fifo[wr_ctx_rptr_q].burst);
+          wr_ctx_fifo[wr_ctx_rptr_q].resp <= wr_resp_after_w;
         end
+      end
 
-        default: begin
-          wr_state_q <= WR_IDLE;
-        end
+      if (b_fire) begin
+        b_resp_rptr_q <= inc_b_ptr(b_resp_rptr_q);
+      end
+
+      unique case ({aw_fire, wr_pop_fire})
+        2'b10: wr_ctx_count_q <= wr_ctx_count_q + 1;
+        2'b01: wr_ctx_count_q <= wr_ctx_count_q - 1;
+        default: wr_ctx_count_q <= wr_ctx_count_q;
+      endcase
+
+      unique case ({wr_pop_fire, b_fire})
+        2'b10: b_resp_count_q <= b_resp_count_q + 1;
+        2'b01: b_resp_count_q <= b_resp_count_q - 1;
+        default: b_resp_count_q <= b_resp_count_q;
       endcase
     end
   end
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      rd_state_q   <= RD_IDLE;
-      s_axi_rid    <= '0;
-      s_axi_rdata  <= '0;
-      s_axi_rresp  <= AXI_RESP_OKAY;
-      s_axi_rlast  <= 1'b0;
-      s_axi_rvalid <= 1'b0;
-      rd_id_q      <= '0;
-      rd_addr_q    <= '0;
-      rd_len_q     <= '0;
-      rd_size_q    <= '0;
-      rd_burst_q   <= AXI_BURST_INCR;
-      rd_beat_q    <= '0;
-      rd_resp_q    <= AXI_RESP_OKAY;
+      rd_ctx_wptr_q  <= '0;
+      rd_ctx_rptr_q  <= '0;
+      rd_ctx_count_q <= 0;
+      s_axi_rid      <= '0;
+      s_axi_rdata    <= '0;
+      s_axi_rresp    <= AXI_RESP_OKAY;
+      s_axi_rlast    <= 1'b0;
+      s_axi_rvalid   <= 1'b0;
     end else begin
-      unique case (rd_state_q)
-        RD_IDLE: begin
-          s_axi_rvalid <= 1'b0;
-          s_axi_rlast  <= 1'b0;
+      if (ar_fire) begin
+        // AR 可提前进入读队列，形成多个读 outstanding；R 第一版按 AR 顺序返回。
+        rd_ctx_fifo[rd_ctx_wptr_q].id    <= s_axi_arid;
+        rd_ctx_fifo[rd_ctx_wptr_q].addr  <= s_axi_araddr;
+        rd_ctx_fifo[rd_ctx_wptr_q].len   <= s_axi_arlen;
+        rd_ctx_fifo[rd_ctx_wptr_q].size  <= s_axi_arsize;
+        rd_ctx_fifo[rd_ctx_wptr_q].burst <= s_axi_arburst;
+        rd_ctx_fifo[rd_ctx_wptr_q].beat  <= '0;
+        rd_ctx_fifo[rd_ctx_wptr_q].resp  <= check_cmd(slave_rd_enable,
+                                                       s_axi_araddr,
+                                                       s_axi_arlen,
+                                                       s_axi_arsize,
+                                                       s_axi_arburst,
+                                                       s_axi_arlock);
+        rd_ctx_wptr_q <= inc_rd_ptr(rd_ctx_wptr_q);
+      end
 
-          if (s_axi_arvalid && s_axi_arready) begin
-            logic [1:0] cmd_resp;
+      if (!s_axi_rvalid && !rd_ctx_empty) begin
+        s_axi_rid    <= rd_ctx_fifo[rd_ctx_rptr_q].id;
+        s_axi_rresp  <= rd_ctx_fifo[rd_ctx_rptr_q].resp;
+        s_axi_rdata  <= (rd_ctx_fifo[rd_ctx_rptr_q].resp == AXI_RESP_OKAY) ?
+                        read_mem_word(rd_ctx_fifo[rd_ctx_rptr_q].addr,
+                                      rd_ctx_fifo[rd_ctx_rptr_q].size) : '0;
+        s_axi_rlast  <= (rd_ctx_fifo[rd_ctx_rptr_q].beat == rd_ctx_fifo[rd_ctx_rptr_q].len);
+        s_axi_rvalid <= 1'b1;
+      end else if (r_fire) begin
+        if (s_axi_rlast) begin
+          s_axi_rvalid  <= 1'b0;
+          s_axi_rlast   <= 1'b0;
+          rd_ctx_rptr_q <= inc_rd_ptr(rd_ctx_rptr_q);
+        end else begin
+          logic [ADDR_WIDTH-1:0] next_rd_addr;
 
-            cmd_resp = check_cmd(slave_rd_enable,
-                                 s_axi_araddr,
-                                 s_axi_arlen,
-                                 s_axi_arsize,
-                                 s_axi_arburst,
-                                 s_axi_arlock);
+          next_rd_addr = next_addr(rd_ctx_fifo[rd_ctx_rptr_q].addr,
+                                   rd_ctx_fifo[rd_ctx_rptr_q].size,
+                                   rd_ctx_fifo[rd_ctx_rptr_q].burst);
 
-            rd_id_q      <= s_axi_arid;
-            rd_addr_q    <= s_axi_araddr;
-            rd_len_q     <= s_axi_arlen;
-            rd_size_q    <= s_axi_arsize;
-            rd_burst_q   <= s_axi_arburst;
-            rd_beat_q    <= '0;
-            rd_resp_q    <= cmd_resp;
-
-            s_axi_rid    <= s_axi_arid;
-            s_axi_rresp  <= cmd_resp;
-            s_axi_rdata  <= (cmd_resp == AXI_RESP_OKAY) ? read_mem_word(s_axi_araddr, s_axi_arsize) : '0;
-            s_axi_rlast  <= (s_axi_arlen == 8'd0);
-            s_axi_rvalid <= 1'b1;
-            rd_state_q   <= RD_DATA;
-          end
+          rd_ctx_fifo[rd_ctx_rptr_q].beat <= rd_ctx_fifo[rd_ctx_rptr_q].beat + 8'd1;
+          rd_ctx_fifo[rd_ctx_rptr_q].addr <= next_rd_addr;
+          s_axi_rid    <= rd_ctx_fifo[rd_ctx_rptr_q].id;
+          s_axi_rresp  <= rd_ctx_fifo[rd_ctx_rptr_q].resp;
+          s_axi_rdata  <= (rd_ctx_fifo[rd_ctx_rptr_q].resp == AXI_RESP_OKAY) ?
+                          read_mem_word(next_rd_addr, rd_ctx_fifo[rd_ctx_rptr_q].size) : '0;
+          s_axi_rlast  <= ((rd_ctx_fifo[rd_ctx_rptr_q].beat + 8'd1) == rd_ctx_fifo[rd_ctx_rptr_q].len);
         end
+      end
 
-        RD_DATA: begin
-          if (s_axi_rvalid && s_axi_rready) begin
-            if (rd_beat_q == rd_len_q) begin
-              s_axi_rvalid <= 1'b0;
-              s_axi_rlast  <= 1'b0;
-              rd_state_q   <= RD_IDLE;
-            end else begin
-              logic [ADDR_WIDTH-1:0] next_rd_addr;
-
-              next_rd_addr = next_addr(rd_addr_q, rd_size_q, rd_burst_q);
-
-              rd_beat_q   <= rd_beat_q + 8'd1;
-              rd_addr_q   <= next_rd_addr;
-              s_axi_rid   <= rd_id_q;
-              s_axi_rresp <= rd_resp_q;
-              s_axi_rdata <= (rd_resp_q == AXI_RESP_OKAY) ? read_mem_word(next_rd_addr, rd_size_q) : '0;
-              s_axi_rlast <= ((rd_beat_q + 8'd1) == rd_len_q);
-            end
-          end
-        end
-
-        default: begin
-          rd_state_q <= RD_IDLE;
-        end
+      unique case ({ar_fire, rd_pop_fire})
+        2'b10: rd_ctx_count_q <= rd_ctx_count_q + 1;
+        2'b01: rd_ctx_count_q <= rd_ctx_count_q - 1;
+        default: rd_ctx_count_q <= rd_ctx_count_q;
       endcase
     end
   end
