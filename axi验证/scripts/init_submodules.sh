@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+git submodule update --init --recursive
+
+echo "Submodules are ready."

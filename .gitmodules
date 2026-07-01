@@ -1,0 +1,3 @@
+[submodule "axi验证/third_party/tvip-axi"]
+	path = axi验证/third_party/tvip-axi
+	url = https://github.com/taichi-ishitani/tvip-axi.git
