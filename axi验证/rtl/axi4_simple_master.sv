@@ -1,46 +1,65 @@
 // -----------------------------------------------------------------------------
 // File       : axi4_simple_master.sv
 // Author     : ChatGPT
-// Description: AXI4 Full simple master。
+// Description: AXI4 Full simple master with ID-aware multi-outstanding support。
 //
 // 特性：
-//   * app_wr_en 触发一次 AXI 写 burst；app_rd_en 触发一次 AXI 读 burst
-//   * 第一版 single outstanding，busy=1 时忽略新的 app 请求
+//   * app_wr_en/app_rd_en 触发 AXI 写/读请求，app_wr_ready/app_rd_ready 表示可接收
+//   * app 侧可指定 AWID/ARID，master 检查 BID/RID 是否属于未完成事务
+//   * 支持多个写/读 outstanding；写数据按 AW 接收顺序发送，读响应按 RID 匹配
 //   * 写数据源第一版固定为 app_wr_data，每个 beat 重复发送同一个数据
-//   * 读数据缓存第一版只保存最后一拍 RDATA 到 app_rd_data
+//   * 读数据缓存第一版只把完成事务的最后一拍 RDATA 放到 app_rd_data
 //   * 正确产生 AWVALID/WVALID/WLAST/BREADY/ARVALID/RREADY，并检查 RLAST
+//
+// 说明：
+//   AXI4 W 通道没有 WID，所以即使 AW 可以多 outstanding，W beat 仍按 AW 顺序发送。
+//   busy=1 表示内部仍有事务在途；不再表示不能接收新请求，请使用 app_*_ready。
 // -----------------------------------------------------------------------------
 `timescale 1ns/1ps
 `default_nettype none
 
 module axi4_simple_master #(
-  parameter int ADDR_WIDTH = 32,
-  parameter int DATA_WIDTH = 64,
-  parameter int ID_WIDTH   = 4,
-  parameter int MEM_BYTES  = 4096
+  parameter int ADDR_WIDTH     = 32,
+  parameter int DATA_WIDTH     = 64,
+  parameter int ID_WIDTH       = 4,
+  parameter int MEM_BYTES      = 4096,
+  parameter int WR_OUTSTANDING = 4,
+  parameter int RD_OUTSTANDING = 4
 ) (
   input  logic                     aclk,
   input  logic                     aresetn,
 
-  // app write control
+  // app write request
   input  logic                     app_wr_en,
+  output logic                     app_wr_ready,
+  input  logic [ID_WIDTH-1:0]      app_wr_id,
   input  logic [ADDR_WIDTH-1:0]    app_wr_addr,
   input  logic [DATA_WIDTH-1:0]    app_wr_data,
   input  logic [7:0]               app_wr_len,
   input  logic [2:0]               app_wr_size,
   input  logic [1:0]               app_wr_burst,
-  output logic                     app_wr_done,
-  output logic [1:0]               app_wr_resp,
 
-  // app read control
+  // app write completion
+  output logic                     app_wr_done,
+  output logic [ID_WIDTH-1:0]      app_wr_done_id,
+  output logic [1:0]               app_wr_resp,
+  output logic                     app_wr_id_error,
+
+  // app read request
   input  logic                     app_rd_en,
+  output logic                     app_rd_ready,
+  input  logic [ID_WIDTH-1:0]      app_rd_id,
   input  logic [ADDR_WIDTH-1:0]    app_rd_addr,
   input  logic [7:0]               app_rd_len,
   input  logic [2:0]               app_rd_size,
   input  logic [1:0]               app_rd_burst,
+
+  // app read completion
   output logic                     app_rd_done,
+  output logic [ID_WIDTH-1:0]      app_rd_done_id,
   output logic [DATA_WIDTH-1:0]    app_rd_data,
   output logic [1:0]               app_rd_resp,
+  output logic                     app_rd_id_error,
 
   output logic                     busy,
 
@@ -97,25 +116,127 @@ module axi4_simple_master #(
   import axi4_defines_pkg::*;
 
   localparam int STRB_WIDTH = DATA_WIDTH / 8;
+  localparam int WR_PTR_W   = (WR_OUTSTANDING <= 1) ? 1 : $clog2(WR_OUTSTANDING);
+  localparam int RD_PTR_W   = (RD_OUTSTANDING <= 1) ? 1 : $clog2(RD_OUTSTANDING);
 
-  typedef enum logic [1:0] {
-    MST_IDLE,
-    MST_WRITE,
-    MST_RD_ADDR,
-    MST_RD_DATA
-  } mst_state_e;
+  typedef struct packed {
+    logic [ID_WIDTH-1:0]   id;
+    logic [ADDR_WIDTH-1:0] addr;
+    logic [DATA_WIDTH-1:0] data;
+    logic [7:0]            len;
+    logic [2:0]            size;
+    logic [1:0]            burst;
+  } wr_req_t;
 
-  mst_state_e mst_state_q;
+  typedef struct packed {
+    logic [ID_WIDTH-1:0]   id;
+    logic [ADDR_WIDTH-1:0] addr;
+    logic [DATA_WIDTH-1:0] data;
+    logic [7:0]            len;
+    logic [2:0]            size;
+    logic [1:0]            burst;
+    logic [7:0]            beat;
+  } wr_data_ctx_t;
 
-  logic [7:0]            wr_len_q;
-  logic [2:0]            wr_size_q;
-  logic [ADDR_WIDTH-1:0] wr_addr_q;
-  logic [DATA_WIDTH-1:0] wr_data_q;
-  logic [7:0]            wr_beat_q;
+  typedef struct packed {
+    logic                  valid;
+    logic [ID_WIDTH-1:0]   id;
+  } wr_active_t;
 
-  logic [7:0]            rd_len_q;
-  logic [7:0]            rd_beat_q;
-  logic [1:0]            rd_resp_q;
+  typedef struct packed {
+    logic [ID_WIDTH-1:0]   id;
+    logic [ADDR_WIDTH-1:0] addr;
+    logic [7:0]            len;
+    logic [2:0]            size;
+    logic [1:0]            burst;
+  } rd_req_t;
+
+  typedef struct packed {
+    logic                  valid;
+    logic [ID_WIDTH-1:0]   id;
+    logic [7:0]            len;
+    logic [7:0]            beat;
+    logic [1:0]            resp;
+  } rd_active_t;
+
+  wr_req_t      wr_req_fifo  [0:WR_OUTSTANDING-1];
+  wr_data_ctx_t wr_data_fifo [0:WR_OUTSTANDING-1];
+  wr_active_t   wr_active    [0:WR_OUTSTANDING-1];
+
+  rd_req_t      rd_req_fifo  [0:RD_OUTSTANDING-1];
+  rd_active_t   rd_active    [0:RD_OUTSTANDING-1];
+
+  logic [WR_PTR_W-1:0] wr_req_wptr_q;
+  logic [WR_PTR_W-1:0] wr_req_rptr_q;
+  logic [WR_PTR_W-1:0] wr_data_wptr_q;
+  logic [WR_PTR_W-1:0] wr_data_rptr_q;
+  logic [RD_PTR_W-1:0] rd_req_wptr_q;
+  logic [RD_PTR_W-1:0] rd_req_rptr_q;
+
+  int unsigned wr_req_count_q;
+  int unsigned wr_data_count_q;
+  int unsigned wr_active_count_q;
+  int unsigned rd_req_count_q;
+  int unsigned rd_active_count_q;
+
+  logic wr_req_empty;
+  logic wr_req_full;
+  logic wr_data_empty;
+  logic wr_data_full;
+  logic wr_active_full;
+  logic rd_req_empty;
+  logic rd_req_full;
+  logic rd_active_full;
+
+  logic wr_app_fire;
+  logic rd_app_fire;
+  logic aw_fire;
+  logic w_fire;
+  logic w_last_fire;
+  logic b_fire;
+  logic ar_fire;
+  logic r_fire;
+
+  logic wr_alloc_found;
+  int unsigned wr_alloc_idx;
+  logic wr_match_found;
+  int unsigned wr_match_idx;
+
+  logic rd_alloc_found;
+  int unsigned rd_alloc_idx;
+  logic rd_match_found;
+  int unsigned rd_match_idx;
+
+  initial begin
+    assert ((DATA_WIDTH == 32) || (DATA_WIDTH == 64) || (DATA_WIDTH == 128))
+      else $error("axi4_simple_master: DATA_WIDTH must be 32, 64, or 128");
+    assert ((DATA_WIDTH % 8) == 0)
+      else $error("axi4_simple_master: DATA_WIDTH must be byte aligned");
+    assert (WR_OUTSTANDING > 0)
+      else $error("axi4_simple_master: WR_OUTSTANDING must be greater than 0");
+    assert (RD_OUTSTANDING > 0)
+      else $error("axi4_simple_master: RD_OUTSTANDING must be greater than 0");
+  end
+
+  function automatic logic [WR_PTR_W-1:0] inc_wr_ptr(input logic [WR_PTR_W-1:0] ptr);
+    begin
+      if (int'(ptr) == (WR_OUTSTANDING - 1)) begin
+        inc_wr_ptr = '0;
+      end else begin
+        inc_wr_ptr = ptr + 1'b1;
+      end
+    end
+  endfunction
+
+  function automatic logic [RD_PTR_W-1:0] inc_rd_ptr(input logic [RD_PTR_W-1:0] ptr);
+    begin
+      if (int'(ptr) == (RD_OUTSTANDING - 1)) begin
+        inc_rd_ptr = '0;
+      end else begin
+        inc_rd_ptr = ptr + 1'b1;
+      end
+    end
+  endfunction
 
   function automatic logic [ADDR_WIDTH-1:0] next_addr(
     input logic [ADDR_WIDTH-1:0] addr,
@@ -183,210 +304,290 @@ module axi4_simple_master #(
     end
   endfunction
 
-  logic wr_last_expected;
-  logic rd_last_expected;
-  logic [1:0] rd_resp_after_r;
+  always_comb begin
+    wr_req_empty     = (wr_req_count_q == 0);
+    wr_req_full      = (wr_req_count_q >= WR_OUTSTANDING);
+    wr_data_empty    = (wr_data_count_q == 0);
+    wr_data_full     = (wr_data_count_q >= WR_OUTSTANDING);
+    wr_active_full   = (wr_active_count_q >= WR_OUTSTANDING);
+    rd_req_empty     = (rd_req_count_q == 0);
+    rd_req_full      = (rd_req_count_q >= RD_OUTSTANDING);
+    rd_active_full   = (rd_active_count_q >= RD_OUTSTANDING);
 
-  assign wr_last_expected = (wr_beat_q == wr_len_q);
-  assign rd_last_expected = (rd_beat_q == rd_len_q);
-  assign rd_resp_after_r  = (m_axi_rresp != AXI_RESP_OKAY) ? m_axi_rresp :
-                            ((m_axi_rlast != rd_last_expected) ? AXI_RESP_SLVERR : rd_resp_q);
+    app_wr_ready     = aresetn && !wr_req_full;
+    app_rd_ready     = aresetn && !rd_req_full;
+
+    wr_alloc_found   = 1'b0;
+    wr_alloc_idx     = 0;
+    for (int i = 0; i < WR_OUTSTANDING; i++) begin
+      if (!wr_active[i].valid && !wr_alloc_found) begin
+        wr_alloc_found = 1'b1;
+        wr_alloc_idx   = i;
+      end
+    end
+
+    wr_match_found   = 1'b0;
+    wr_match_idx     = 0;
+    for (int i = 0; i < WR_OUTSTANDING; i++) begin
+      if (wr_active[i].valid && (wr_active[i].id === m_axi_bid) && !wr_match_found) begin
+        wr_match_found = 1'b1;
+        wr_match_idx   = i;
+      end
+    end
+
+    rd_alloc_found   = 1'b0;
+    rd_alloc_idx     = 0;
+    for (int i = 0; i < RD_OUTSTANDING; i++) begin
+      if (!rd_active[i].valid && !rd_alloc_found) begin
+        rd_alloc_found = 1'b1;
+        rd_alloc_idx   = i;
+      end
+    end
+
+    rd_match_found   = 1'b0;
+    rd_match_idx     = 0;
+    for (int i = 0; i < RD_OUTSTANDING; i++) begin
+      if (rd_active[i].valid && (rd_active[i].id === m_axi_rid) && !rd_match_found) begin
+        rd_match_found = 1'b1;
+        rd_match_idx   = i;
+      end
+    end
+
+    m_axi_awvalid    = aresetn && !wr_req_empty && !wr_data_full && !wr_active_full && wr_alloc_found;
+    m_axi_awid       = wr_req_empty ? '0 : wr_req_fifo[wr_req_rptr_q].id;
+    m_axi_awaddr     = wr_req_empty ? '0 : wr_req_fifo[wr_req_rptr_q].addr;
+    m_axi_awlen      = wr_req_empty ? '0 : wr_req_fifo[wr_req_rptr_q].len;
+    m_axi_awsize     = wr_req_empty ? '0 : wr_req_fifo[wr_req_rptr_q].size;
+    m_axi_awburst    = wr_req_empty ? AXI_BURST_INCR : wr_req_fifo[wr_req_rptr_q].burst;
+    m_axi_awlock     = 1'b0;
+    m_axi_awcache    = 4'b0011;
+    m_axi_awprot     = 3'b000;
+    m_axi_awqos      = 4'b0000;
+    m_axi_awregion   = 4'b0000;
+
+    m_axi_wvalid     = aresetn && !wr_data_empty;
+    m_axi_wdata      = wr_data_empty ? '0 : align_wdata(wr_data_fifo[wr_data_rptr_q].addr,
+                                                        wr_data_fifo[wr_data_rptr_q].size,
+                                                        wr_data_fifo[wr_data_rptr_q].data);
+    m_axi_wstrb      = wr_data_empty ? '0 : gen_wstrb(wr_data_fifo[wr_data_rptr_q].addr,
+                                                     wr_data_fifo[wr_data_rptr_q].size);
+    m_axi_wlast      = (!wr_data_empty) &&
+                       (wr_data_fifo[wr_data_rptr_q].beat == wr_data_fifo[wr_data_rptr_q].len);
+    m_axi_bready     = aresetn;
+
+    m_axi_arvalid    = aresetn && !rd_req_empty && !rd_active_full && rd_alloc_found;
+    m_axi_arid       = rd_req_empty ? '0 : rd_req_fifo[rd_req_rptr_q].id;
+    m_axi_araddr     = rd_req_empty ? '0 : rd_req_fifo[rd_req_rptr_q].addr;
+    m_axi_arlen      = rd_req_empty ? '0 : rd_req_fifo[rd_req_rptr_q].len;
+    m_axi_arsize     = rd_req_empty ? '0 : rd_req_fifo[rd_req_rptr_q].size;
+    m_axi_arburst    = rd_req_empty ? AXI_BURST_INCR : rd_req_fifo[rd_req_rptr_q].burst;
+    m_axi_arlock     = 1'b0;
+    m_axi_arcache    = 4'b0011;
+    m_axi_arprot     = 3'b000;
+    m_axi_arqos      = 4'b0000;
+    m_axi_arregion   = 4'b0000;
+    m_axi_rready     = aresetn;
+
+    // busy 表示仍有请求排队、写数据未发完、或响应未回完；不再用于阻塞 app 新请求。
+    busy             = (wr_req_count_q != 0) || (wr_data_count_q != 0) ||
+                       (wr_active_count_q != 0) || (rd_req_count_q != 0) ||
+                       (rd_active_count_q != 0) || m_axi_awvalid || m_axi_arvalid ||
+                       m_axi_wvalid;
+
+    wr_app_fire      = app_wr_en && app_wr_ready;
+    rd_app_fire      = app_rd_en && app_rd_ready;
+    aw_fire          = m_axi_awvalid && m_axi_awready;
+    w_fire           = m_axi_wvalid  && m_axi_wready;
+    w_last_fire      = w_fire && m_axi_wlast;
+    b_fire           = m_axi_bvalid  && m_axi_bready;
+    ar_fire          = m_axi_arvalid && m_axi_arready;
+    r_fire           = m_axi_rvalid  && m_axi_rready;
+  end
 
   always_ff @(posedge aclk or negedge aresetn) begin
     if (!aresetn) begin
-      mst_state_q    <= MST_IDLE;
-      busy           <= 1'b0;
+      wr_req_wptr_q     <= '0;
+      wr_req_rptr_q     <= '0;
+      wr_data_wptr_q    <= '0;
+      wr_data_rptr_q    <= '0;
+      wr_req_count_q    <= 0;
+      wr_data_count_q   <= 0;
+      wr_active_count_q <= 0;
+      app_wr_done       <= 1'b0;
+      app_wr_done_id    <= '0;
+      app_wr_resp       <= AXI_RESP_OKAY;
+      app_wr_id_error   <= 1'b0;
 
-      app_wr_done    <= 1'b0;
-      app_wr_resp    <= AXI_RESP_OKAY;
-      app_rd_done    <= 1'b0;
-      app_rd_data    <= '0;
-      app_rd_resp    <= AXI_RESP_OKAY;
-
-      m_axi_awid     <= '0;
-      m_axi_awaddr   <= '0;
-      m_axi_awlen    <= '0;
-      m_axi_awsize   <= '0;
-      m_axi_awburst  <= AXI_BURST_INCR;
-      m_axi_awlock   <= 1'b0;
-      m_axi_awcache  <= 4'b0011;
-      m_axi_awprot   <= 3'b000;
-      m_axi_awqos    <= 4'b0000;
-      m_axi_awregion <= 4'b0000;
-      m_axi_awvalid  <= 1'b0;
-
-      m_axi_wdata    <= '0;
-      m_axi_wstrb    <= '0;
-      m_axi_wlast    <= 1'b0;
-      m_axi_wvalid   <= 1'b0;
-
-      m_axi_bready   <= 1'b0;
-
-      m_axi_arid     <= '0;
-      m_axi_araddr   <= '0;
-      m_axi_arlen    <= '0;
-      m_axi_arsize   <= '0;
-      m_axi_arburst  <= AXI_BURST_INCR;
-      m_axi_arlock   <= 1'b0;
-      m_axi_arcache  <= 4'b0011;
-      m_axi_arprot   <= 3'b000;
-      m_axi_arqos    <= 4'b0000;
-      m_axi_arregion <= 4'b0000;
-      m_axi_arvalid  <= 1'b0;
-
-      m_axi_rready   <= 1'b0;
-
-      wr_len_q       <= '0;
-      wr_size_q      <= '0;
-      wr_addr_q      <= '0;
-      wr_data_q      <= '0;
-      wr_beat_q      <= '0;
-      rd_len_q       <= '0;
-      rd_beat_q      <= '0;
-      rd_resp_q      <= AXI_RESP_OKAY;
+      for (int i = 0; i < WR_OUTSTANDING; i++) begin
+        wr_active[i].valid <= 1'b0;
+        wr_active[i].id    <= '0;
+      end
     end else begin
-      // done 信号为单周期脉冲。
-      app_wr_done <= 1'b0;
-      app_rd_done <= 1'b0;
+      app_wr_done     <= 1'b0;
+      app_wr_id_error <= 1'b0;
 
-      unique case (mst_state_q)
-        MST_IDLE: begin
-          busy          <= 1'b0;
-          m_axi_awvalid <= 1'b0;
-          m_axi_wvalid  <= 1'b0;
-          m_axi_wlast   <= 1'b0;
-          m_axi_bready  <= 1'b0;
-          m_axi_arvalid <= 1'b0;
-          m_axi_rready  <= 1'b0;
+      if (wr_app_fire) begin
+        wr_req_fifo[wr_req_wptr_q].id    <= app_wr_id;
+        wr_req_fifo[wr_req_wptr_q].addr  <= app_wr_addr;
+        wr_req_fifo[wr_req_wptr_q].data  <= app_wr_data;
+        wr_req_fifo[wr_req_wptr_q].len   <= app_wr_len;
+        wr_req_fifo[wr_req_wptr_q].size  <= app_wr_size;
+        wr_req_fifo[wr_req_wptr_q].burst <= app_wr_burst;
+        wr_req_wptr_q <= inc_wr_ptr(wr_req_wptr_q);
+      end
 
-          // 当 app_wr_en 和 app_rd_en 同时有效时，写请求优先。
-          // busy=1 时新的 app 请求会被忽略，app 侧应等待 busy 拉低后再发起下一笔。
-          if (app_wr_en) begin
-            busy           <= 1'b1;
-            mst_state_q    <= MST_WRITE;
+      if (aw_fire) begin
+        // AW 被 slave 接收后，写数据事务进入 W 队列；BID 用 active ID 表跟踪。
+        wr_data_fifo[wr_data_wptr_q].id    <= wr_req_fifo[wr_req_rptr_q].id;
+        wr_data_fifo[wr_data_wptr_q].addr  <= wr_req_fifo[wr_req_rptr_q].addr;
+        wr_data_fifo[wr_data_wptr_q].data  <= wr_req_fifo[wr_req_rptr_q].data;
+        wr_data_fifo[wr_data_wptr_q].len   <= wr_req_fifo[wr_req_rptr_q].len;
+        wr_data_fifo[wr_data_wptr_q].size  <= wr_req_fifo[wr_req_rptr_q].size;
+        wr_data_fifo[wr_data_wptr_q].burst <= wr_req_fifo[wr_req_rptr_q].burst;
+        wr_data_fifo[wr_data_wptr_q].beat  <= '0;
+        wr_data_wptr_q <= inc_wr_ptr(wr_data_wptr_q);
 
-            wr_len_q       <= app_wr_len;
-            wr_size_q      <= app_wr_size;
-            wr_addr_q      <= app_wr_addr;
-            wr_data_q      <= app_wr_data;
-            wr_beat_q      <= '0;
+        wr_active[wr_alloc_idx].valid <= 1'b1;
+        wr_active[wr_alloc_idx].id    <= wr_req_fifo[wr_req_rptr_q].id;
+        wr_req_rptr_q <= inc_wr_ptr(wr_req_rptr_q);
+      end
 
-            m_axi_awid     <= '0;
-            m_axi_awaddr   <= app_wr_addr;
-            m_axi_awlen    <= app_wr_len;
-            m_axi_awsize   <= app_wr_size;
-            m_axi_awburst  <= app_wr_burst;
-            m_axi_awlock   <= 1'b0;
-            m_axi_awcache  <= 4'b0011;
-            m_axi_awprot   <= 3'b000;
-            m_axi_awqos    <= 4'b0000;
-            m_axi_awregion <= 4'b0000;
-            m_axi_awvalid  <= 1'b1;
-
-            m_axi_wdata    <= align_wdata(app_wr_addr, app_wr_size, app_wr_data);
-            m_axi_wstrb    <= gen_wstrb(app_wr_addr, app_wr_size);
-            m_axi_wlast    <= (app_wr_len == 8'd0);
-            m_axi_wvalid   <= 1'b1;
-
-            // BREADY 可以提前拉高，表示 master 随时可接收写响应。
-            m_axi_bready   <= 1'b1;
-            app_wr_resp    <= AXI_RESP_OKAY;
-          end else if (app_rd_en) begin
-            busy           <= 1'b1;
-            mst_state_q    <= MST_RD_ADDR;
-
-            rd_len_q       <= app_rd_len;
-            rd_beat_q      <= '0;
-            rd_resp_q      <= AXI_RESP_OKAY;
-            app_rd_resp    <= AXI_RESP_OKAY;
-
-            m_axi_arid     <= '0;
-            m_axi_araddr   <= app_rd_addr;
-            m_axi_arlen    <= app_rd_len;
-            m_axi_arsize   <= app_rd_size;
-            m_axi_arburst  <= app_rd_burst;
-            m_axi_arlock   <= 1'b0;
-            m_axi_arcache  <= 4'b0011;
-            m_axi_arprot   <= 3'b000;
-            m_axi_arqos    <= 4'b0000;
-            m_axi_arregion <= 4'b0000;
-            m_axi_arvalid  <= 1'b1;
-          end
+      if (w_fire) begin
+        if (m_axi_wlast) begin
+          wr_data_rptr_q <= inc_wr_ptr(wr_data_rptr_q);
+        end else begin
+          wr_data_fifo[wr_data_rptr_q].beat <= wr_data_fifo[wr_data_rptr_q].beat + 8'd1;
+          wr_data_fifo[wr_data_rptr_q].addr <= next_addr(wr_data_fifo[wr_data_rptr_q].addr,
+                                                         wr_data_fifo[wr_data_rptr_q].size,
+                                                         wr_data_fifo[wr_data_rptr_q].burst);
         end
+      end
 
-        MST_WRITE: begin
-          busy <= 1'b1;
+      if (b_fire) begin
+        app_wr_done    <= 1'b1;
+        app_wr_done_id <= m_axi_bid;
 
-          if (m_axi_awvalid && m_axi_awready) begin
-            m_axi_awvalid <= 1'b0;
-          end
-
-          if (m_axi_wvalid && m_axi_wready) begin
-            if (wr_last_expected) begin
-              m_axi_wvalid <= 1'b0;
-              m_axi_wlast  <= 1'b0;
-            end else begin
-              wr_beat_q    <= wr_beat_q + 8'd1;
-              wr_addr_q    <= next_addr(wr_addr_q, wr_size_q, m_axi_awburst);
-              m_axi_wdata  <= align_wdata(next_addr(wr_addr_q, wr_size_q, m_axi_awburst), wr_size_q, wr_data_q);
-              m_axi_wstrb  <= gen_wstrb(next_addr(wr_addr_q, wr_size_q, m_axi_awburst), wr_size_q);
-              m_axi_wlast  <= ((wr_beat_q + 8'd1) == wr_len_q);
-              // 第一版每拍重复发送 app_wr_data，后续可替换为 FIFO 数据源。
-            end
-          end
-
-          if (m_axi_bvalid && m_axi_bready) begin
-            app_wr_resp   <= m_axi_bresp;
-            app_wr_done   <= 1'b1;
-            m_axi_bready  <= 1'b0;
-            m_axi_awvalid <= 1'b0;
-            m_axi_wvalid  <= 1'b0;
-            m_axi_wlast   <= 1'b0;
-            busy          <= 1'b0;
-            mst_state_q   <= MST_IDLE;
-          end
+        if (wr_match_found) begin
+          app_wr_resp <= m_axi_bresp;
+          wr_active[wr_match_idx].valid <= 1'b0;
+        end else begin
+          // 收到未知 BID：说明 slave/VIP 返回了不属于未完成事务的响应。
+          app_wr_resp     <= AXI_RESP_SLVERR;
+          app_wr_id_error <= 1'b1;
         end
+      end
 
-        MST_RD_ADDR: begin
-          busy <= 1'b1;
+      unique case ({wr_app_fire, aw_fire})
+        2'b10: wr_req_count_q <= wr_req_count_q + 1;
+        2'b01: wr_req_count_q <= wr_req_count_q - 1;
+        default: wr_req_count_q <= wr_req_count_q;
+      endcase
 
-          if (m_axi_arvalid && m_axi_arready) begin
-            m_axi_arvalid <= 1'b0;
-            m_axi_rready  <= 1'b1;
-            mst_state_q   <= MST_RD_DATA;
-          end
-        end
+      unique case ({aw_fire, w_last_fire})
+        2'b10: wr_data_count_q <= wr_data_count_q + 1;
+        2'b01: wr_data_count_q <= wr_data_count_q - 1;
+        default: wr_data_count_q <= wr_data_count_q;
+      endcase
 
-        MST_RD_DATA: begin
-          busy <= 1'b1;
-
-          if (m_axi_rvalid && m_axi_rready) begin
-            app_rd_data <= m_axi_rdata;  // 第一版只保留最后一次握手看到的数据。
-            rd_resp_q   <= rd_resp_after_r;
-
-            if (rd_last_expected || m_axi_rlast) begin
-              app_rd_resp  <= rd_resp_after_r;
-              app_rd_done  <= 1'b1;
-              m_axi_rready <= 1'b0;
-              busy         <= 1'b0;
-              mst_state_q  <= MST_IDLE;
-            end else begin
-              rd_beat_q <= rd_beat_q + 8'd1;
-            end
-          end
-        end
-
-        default: begin
-          mst_state_q <= MST_IDLE;
-          busy        <= 1'b0;
-        end
+      unique case ({aw_fire, (b_fire && wr_match_found)})
+        2'b10: wr_active_count_q <= wr_active_count_q + 1;
+        2'b01: wr_active_count_q <= wr_active_count_q - 1;
+        default: wr_active_count_q <= wr_active_count_q;
       endcase
     end
   end
 
-  // 当前 master 固定发 ID=0，不检查 BID/RID 与 ID 匹配；single outstanding 下不会乱序。
-  logic unused_axi_id;
-  assign unused_axi_id = ^{m_axi_bid, m_axi_rid};
+  always_ff @(posedge aclk or negedge aresetn) begin
+    if (!aresetn) begin
+      rd_req_wptr_q     <= '0;
+      rd_req_rptr_q     <= '0;
+      rd_req_count_q    <= 0;
+      rd_active_count_q <= 0;
+      app_rd_done       <= 1'b0;
+      app_rd_done_id    <= '0;
+      app_rd_data       <= '0;
+      app_rd_resp       <= AXI_RESP_OKAY;
+      app_rd_id_error   <= 1'b0;
+
+      for (int i = 0; i < RD_OUTSTANDING; i++) begin
+        rd_active[i].valid <= 1'b0;
+        rd_active[i].id    <= '0;
+        rd_active[i].len   <= '0;
+        rd_active[i].beat  <= '0;
+        rd_active[i].resp  <= AXI_RESP_OKAY;
+      end
+    end else begin
+      app_rd_done     <= 1'b0;
+      app_rd_id_error <= 1'b0;
+
+      if (rd_app_fire) begin
+        rd_req_fifo[rd_req_wptr_q].id    <= app_rd_id;
+        rd_req_fifo[rd_req_wptr_q].addr  <= app_rd_addr;
+        rd_req_fifo[rd_req_wptr_q].len   <= app_rd_len;
+        rd_req_fifo[rd_req_wptr_q].size  <= app_rd_size;
+        rd_req_fifo[rd_req_wptr_q].burst <= app_rd_burst;
+        rd_req_wptr_q <= inc_rd_ptr(rd_req_wptr_q);
+      end
+
+      if (ar_fire) begin
+        rd_active[rd_alloc_idx].valid <= 1'b1;
+        rd_active[rd_alloc_idx].id    <= rd_req_fifo[rd_req_rptr_q].id;
+        rd_active[rd_alloc_idx].len   <= rd_req_fifo[rd_req_rptr_q].len;
+        rd_active[rd_alloc_idx].beat  <= '0;
+        rd_active[rd_alloc_idx].resp  <= AXI_RESP_OKAY;
+        rd_req_rptr_q <= inc_rd_ptr(rd_req_rptr_q);
+      end
+
+      if (r_fire) begin
+        if (rd_match_found) begin
+          logic rd_last_expected;
+          logic [1:0] rd_resp_new;
+
+          rd_last_expected = (rd_active[rd_match_idx].beat == rd_active[rd_match_idx].len);
+          rd_resp_new      = rd_active[rd_match_idx].resp;
+
+          if (m_axi_rresp != AXI_RESP_OKAY) begin
+            rd_resp_new = m_axi_rresp;
+          end
+
+          if (m_axi_rlast != rd_last_expected) begin
+            rd_resp_new = AXI_RESP_SLVERR;
+          end
+
+          app_rd_data <= m_axi_rdata;
+
+          if (m_axi_rlast || rd_last_expected) begin
+            app_rd_done    <= 1'b1;
+            app_rd_done_id <= m_axi_rid;
+            app_rd_resp    <= rd_resp_new;
+            rd_active[rd_match_idx].valid <= 1'b0;
+          end else begin
+            rd_active[rd_match_idx].beat <= rd_active[rd_match_idx].beat + 8'd1;
+            rd_active[rd_match_idx].resp <= rd_resp_new;
+          end
+        end else begin
+          // 收到未知 RID：说明 slave/VIP 返回了不属于未完成事务的数据。
+          app_rd_done     <= 1'b1;
+          app_rd_done_id  <= m_axi_rid;
+          app_rd_data     <= m_axi_rdata;
+          app_rd_resp     <= AXI_RESP_SLVERR;
+          app_rd_id_error <= 1'b1;
+        end
+      end
+
+      unique case ({rd_app_fire, ar_fire})
+        2'b10: rd_req_count_q <= rd_req_count_q + 1;
+        2'b01: rd_req_count_q <= rd_req_count_q - 1;
+        default: rd_req_count_q <= rd_req_count_q;
+      endcase
+
+      unique case ({ar_fire, (r_fire && rd_match_found && (m_axi_rlast || (rd_active[rd_match_idx].beat == rd_active[rd_match_idx].len)))})
+        2'b10: rd_active_count_q <= rd_active_count_q + 1;
+        2'b01: rd_active_count_q <= rd_active_count_q - 1;
+        default: rd_active_count_q <= rd_active_count_q;
+      endcase
+    end
+  end
 
   // MEM_BYTES 参数保留用于和 slave/top 参数列表保持一致，当前 master 不直接使用 memory。
   logic unused_param;
